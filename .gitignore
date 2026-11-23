@@ -1,0 +1,9 @@
+node_modules/
+sessions/
+sessions.json
+.env
+.env.local
+*.tfstate
+*.tfstate.backup
+plan.tfplan
+.terraform/
