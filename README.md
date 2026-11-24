@@ -130,3 +130,155 @@ session-vm-service/
 - `backend "local"` keeps state on this machine — no remote backend required.
 - Destroy is best-effort; if `terraform destroy` fails, rerun manually from
   `sessions/<id>/`.
+
+---
+
+## CI/CD: Deploy to GCP VM
+
+Every push to `main` deploys this service to a single, pre-provisioned GCP VM
+via GitHub Actions over SSH. The workflow SSHes into the VM, pulls the latest
+code, installs production deps, and restarts the process under `pm2`. The
+`sessions/` directory and `sessions.json` are gitignored and left intact across
+deploys.
+
+```
+push to main  ──►  GitHub Actions  ──►  SSH (appleboy/ssh-action)
+                                              │
+                                              ▼
+                              apt + node + pm2 (first run only)
+                              git pull origin main
+                              npm ci --omit=dev
+                              write .env + SA key
+                              pm2 restart session-service
+                              GET /health  ──► green ✅
+```
+
+### Prerequisites
+
+- A Debian/Ubuntu GCP VM with a **public IP** and **port 22 reachable from
+  GitHub Actions** (or your CIDR — e.g. `35.235.0.0/16` and
+  `4.227.0.0/16` for `actions.githubusercontent.com`).
+- A non-root SSH user with **passwordless `sudo`** on the VM (the workflow
+  installs Node.js, git, pm2, and writes `/etc/session-service/`).
+- A **GCP service account** with permission to create Compute Engine VMs and
+  firewall rules in your project. Save its JSON key file — it goes into a
+  GitHub secret.
+- A **GitHub Personal Access Token** (classic with `repo` scope, or
+  fine-grained with read access to this repo). The VM uses it to
+  `git pull` over HTTPS. Use a fine-grained token scoped to a single repo if
+  you want to follow least-privilege.
+
+### One-time VM bootstrap
+
+The workflow is fully idempotent and will bootstrap a fresh VM on the first run,
+but if you prefer to see what's installed before pushing, run the bootstrap
+script manually:
+
+```bash
+# From your laptop — replace session-vm with your instance name
+gcloud compute ssh session-vm --command 'curl -fsSL https://raw.githubusercontent.com/vinaykumargudi/session-service/main/scripts/setup-vm.sh | bash'
+```
+
+Or SSH in directly:
+
+```bash
+gcloud compute ssh session-vm
+curl -fsSL https://raw.githubusercontent.com/vinaykumargudi/session-service/main/scripts/setup-vm.sh | bash
+```
+
+What it does:
+
+1. Installs Node.js 20.x, git, and curl (if missing).
+2. Installs `pm2` globally (if missing).
+3. Creates `/etc/session-service/` (mode 750, owned by the SSH user) — the
+   service-account key will be written here on every deploy.
+4. Enables `pm2` as a systemd service so the app resurrects after VM reboot.
+
+### Configure GitHub secrets and variables
+
+Go to **Settings → Secrets and variables → Actions** for this repo, then add
+the values below.
+
+#### Secrets
+
+| Name | Required | Description |
+| --- | --- | --- |
+| `GCP_VM_SSH_KEY` | yes | Private SSH key (PEM, OpenSSH format) whose **public counterpart is on the VM**. Include the full key — `-----BEGIN OPENSSH PRIVATE KEY-----` … `-----END OPENSSH PRIVATE KEY-----` — including newlines. |
+| `GCP_SA_KEY` | yes | The GCP service account JSON key (full file contents). Used by the service on the VM to authenticate to Compute Engine. The workflow writes it to `/etc/session-service/gcp-sa-key.json` with mode `600`. |
+| `GITHUB_DEPLOY_TOKEN` | yes | GitHub PAT used by the VM for `git pull` over HTTPS. **Classic** token with `repo` scope, or a **fine-grained** token with read access to this repo. Revoke and rotate by editing this secret. |
+
+#### Variables
+
+| Name | Required | Default | Description |
+| --- | --- | --- | --- |
+| `GCP_VM_HOST` | yes | — | Public IP or DNS of the target GCP VM. |
+| `GCP_VM_USER` | yes | — | SSH user on the VM (e.g. `deploy`). Must have passwordless `sudo`. |
+| `GCP_VM_PORT` | no | `22` | SSH port. |
+| `GOOGLE_PROJECT` | yes | — | GCP project ID the service runs against. |
+| `GOOGLE_REGION` | no | `us-central1` | Default GCP region. |
+| `GOOGLE_ZONE` | no | `us-central1-a` | Default GCP zone. |
+| `APP_DIR` | no | `/opt/session-service` | Install path on the VM. The workflow clones/updates this directory. |
+| `PORT` | no | `3000` | Port the service listens on (also published in the health check). |
+
+#### Adding secrets with multiline content
+
+The GitHub web UI handles multiline secrets (SSH keys, JSON) fine — paste the
+full content. From the CLI:
+
+```bash
+# SSH key
+gh secret set GCP_VM_SSH_KEY < ~/.ssh/id_rsa
+
+# GCP service account JSON
+gh secret set GCP_SA_KEY < ~/keys/sa-key.json
+
+# GitHub PAT
+gh secret set GITHUB_DEPLOY_TOKEN
+# paste token on stdin
+```
+
+Variables (non-secret config):
+
+```bash
+gh variable set GCP_VM_HOST --body '34.123.45.67'
+gh variable set GCP_VM_USER --body 'deploy'
+gh variable set GOOGLE_PROJECT --body 'my-gcp-project-id'
+```
+
+### Deploy
+
+- **Automatic:** push to `main`. Markdown, `.gitignore`, and `.github/**` only
+  changes do **not** trigger a deploy.
+- **Manual:** Actions tab → "Deploy to GCP VM" → Run workflow.
+
+The workflow:
+
+1. SSHes into the VM with `GCP_VM_SSH_KEY`.
+2. **First run only:** installs Node.js + git + pm2, creates
+   `/etc/session-service/`, clones the repo into `APP_DIR`, and registers pm2
+   for systemd boot.
+3. **Every run:** `git pull`s `main`, runs `npm ci --omit=dev`, writes the GCP
+   service account key to `/etc/session-service/gcp-sa-key.json` (mode 600),
+   rewrites `.env`, restarts `pm2` (delete + start), and polls `/health` for
+   up to 10 s.
+4. If the health check fails, the step fails with the last 50 lines of pm2
+   logs attached.
+
+`sessions/`, `sessions.json`, and any SSH keys generated under
+`sessions/<id>/` are preserved across deploys because they are in
+`.gitignore`.
+
+### Tearing down a session on the deployed VM
+
+The service exposes `/destroy-session/:id` as normal:
+
+```bash
+curl -s -X POST http://<GCP_VM_HOST>:3000/destroy-session/a1b2c3d4e5f6
+```
+
+If you need to SSH into the deployed VM to inspect state:
+
+```bash
+gcloud compute ssh session-vm
+sudo -u deploy bash -c 'cd /opt/session-service && pm2 logs session-service'
+```
