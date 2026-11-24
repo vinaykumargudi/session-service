@@ -1,0 +1,125 @@
+name: Deploy to GCP VM
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+      - '.github/**'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to ${{ vars.GCP_VM_HOST }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ vars.GCP_VM_HOST }}
+          username: ${{ vars.GCP_VM_USER }}
+          port: ${{ vars.GCP_VM_PORT || 22 }}
+          key: ${{ secrets.GCP_VM_SSH_KEY }}
+          command_timeout: 10m
+          envs: >-
+            GITHUB_DEPLOY_TOKEN
+            GOOGLE_PROJECT
+            GOOGLE_REGION
+            GOOGLE_ZONE
+            GCP_SA_KEY
+            APP_DIR
+            PORT
+          script: |
+            set -euo pipefail
+
+            APP_DIR="${APP_DIR:-/opt/session-service}"
+            REPO_URL="https://x-access-token:${GITHUB_DEPLOY_TOKEN}@github.com/vinaykumargudi/session-service.git"
+            SA_KEY_PATH="/etc/session-service/gcp-sa-key.json"
+            SERVICE_PORT="${PORT:-3000}"
+
+            echo "==> Deploy target: $APP_DIR on $(hostname)"
+
+            # ---- First-time VM bootstrap (idempotent) ----
+            if [ ! -d "$APP_DIR/.git" ]; then
+              echo "==> First-time bootstrap: provisioning $APP_DIR"
+
+              if ! command -v node >/dev/null 2>&1; then
+                echo "==> Installing Node.js 20.x + git + curl"
+                curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+                sudo apt-get update
+                sudo apt-get install -y nodejs git curl
+              else
+                echo "==> Node.js already installed: $(node --version)"
+                command -v git  >/dev/null 2>&1 || sudo apt-get install -y git
+                command -v curl >/dev/null 2>&1 || sudo apt-get install -y curl
+              fi
+
+              if ! command -v pm2 >/dev/null 2>&1; then
+                echo "==> Installing pm2 globally"
+                sudo npm install -g pm2
+              fi
+
+              sudo mkdir -p "$(dirname "$SA_KEY_PATH")"
+              sudo chown "$USER":"$USER" "$(dirname "$SA_KEY_PATH")"
+              sudo chmod 750 "$(dirname "$SA_KEY_PATH")"
+
+              sudo mkdir -p "$(dirname "$APP_DIR")"
+              sudo chown "$USER":"$USER" "$(dirname "$APP_DIR")"
+
+              git clone "$REPO_URL" "$APP_DIR"
+
+              echo "==> Enabling pm2 on boot (systemd)"
+              pm2 startup systemd -u "$USER" --hp "$HOME" | tail -1 | sudo bash || true
+            fi
+
+            cd "$APP_DIR"
+
+            echo "==> Pulling latest main"
+            git fetch origin main
+            git reset --hard origin/main
+
+            echo "==> Installing production dependencies"
+            npm ci --omit=dev
+
+            echo "==> Writing GCP service account key to $SA_KEY_PATH"
+            printf '%s' "$GCP_SA_KEY" | sudo tee "$SA_KEY_PATH" >/dev/null
+            sudo chmod 600 "$SA_KEY_PATH"
+            sudo chown "$USER":"$USER" "$SA_KEY_PATH"
+
+            echo "==> Writing .env"
+            cat > .env <<EOF
+            GOOGLE_PROJECT=${GOOGLE_PROJECT}
+            GOOGLE_REGION=${GOOGLE_REGION:-us-central1}
+            GOOGLE_ZONE=${GOOGLE_ZONE:-us-central1-a}
+            PORT=${SERVICE_PORT}
+            GOOGLE_APPLICATION_CREDENTIALS=${SA_KEY_PATH}
+            EOF
+
+            echo "==> Restarting service with pm2"
+            pm2 delete session-service 2>/dev/null || true
+            pm2 start npm --name session-service -- start
+            pm2 save
+
+            echo "==> Waiting for service to come up"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsS "http://localhost:${SERVICE_PORT}/health" >/dev/null 2>&1; then
+                echo "==> Health check OK"
+                break
+              fi
+              sleep 1
+            done
+
+            if ! curl -fsS "http://localhost:${SERVICE_PORT}/health" >/dev/null 2>&1; then
+              echo "::error::Health check failed after restart"
+              pm2 logs session-service --lines 50 --nostream || true
+              exit 1
+            fi
+
+            echo "==> Deploy complete"
